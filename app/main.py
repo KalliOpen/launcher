@@ -380,7 +380,7 @@ class Window(Gtk.ApplicationWindow):
             logger.info("Start button pressed")
             self.transition = "starting"
             self.refresh()
-            self.run_async(lambda: docker.compose("up", "-d"), "Starting KalliOpen")
+            self.run_async(docker.start, "Starting KalliOpen")
 
     def open_kalliopen(self, *_):
         logger.info("Open KalliOpen button pressed")
@@ -426,7 +426,7 @@ class Window(Gtk.ApplicationWindow):
         def setup():
             if not docker.available(): docker.install()
             docker.compose("pull")
-            docker.compose("up", "-d")
+            docker.start()
         self.run_async(setup, "Setup complete")
 
     def show_migration(self, *_):

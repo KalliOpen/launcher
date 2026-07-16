@@ -121,6 +121,12 @@ def migrate() -> None:
     compose("exec", "-T", "app", "pnpm", "run", "db:migrate")
 
 
+def start() -> None:
+    logger.info("Starting KalliOpen services and applying database migrations")
+    compose("up", "-d")
+    migrate()
+
+
 def update() -> None:
     logger.info("Pulling and applying KalliOpen application update")
     compose("pull", "app")
