@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=KalliOpen Launcher
+Exec=kalliopen-launcher
+X-GNOME-Autostart-enabled=true

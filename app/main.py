@@ -1,0 +1,459 @@
+from __future__ import annotations
+
+import threading
+import webbrowser
+import logging
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk, GLib, Gio
+
+from . import config, docker
+from .migration_workflow import MigrationSession, source_versions
+from .migrator.postgres import PostgresConfig
+
+logger = logging.getLogger(__name__)
+
+
+class MigrationDialog(Gtk.Window):
+    def __init__(self, parent: Gtk.Window):
+        super().__init__(title="Migrate ps-biblio data", transient_for=parent, modal=True)
+        self.parent_window = parent
+        self.session: MigrationSession | None = None
+        self.target_config: PostgresConfig | None = None
+        self.mdf_path: str | None = None
+        self.ldf_path: str | None = None
+        self.status = Gtk.Label(xalign=0, wrap=True)
+        self.report = Gtk.TextView(editable=False, cursor_visible=False, monospace=True)
+        self.report.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.report.set_top_margin(10); self.report.set_bottom_margin(10)
+        self.report.set_left_margin(10); self.report.set_right_margin(10)
+        self.report.add_css_class("migration-report")
+        self.report_scroll = Gtk.ScrolledWindow()
+        self.report_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.report_scroll.set_min_content_height(150)
+        self.report_scroll.set_max_content_height(220)
+        self.report_scroll.set_propagate_natural_height(True)
+        self.report_scroll.set_child(self.report)
+        self.report_scroll.set_visible(False)
+        self.version = Gtk.ComboBoxText()
+        for version in source_versions():
+            self.version.append_text(f"SQL Server {version.upper()}")
+        self.version.set_active(source_versions().index("2022"))
+        self.custom_postgres = Gtk.CheckButton(label="Use custom PostgreSQL connection")
+        self.custom_postgres.connect("toggled", lambda button: self.pg_fields.set_visible(button.get_active()))
+        self.pg_fields = Gtk.Grid(column_spacing=10, row_spacing=8)
+        self.pg_fields.set_visible(False)
+        self.pg_host = self._entry("localhost")
+        self.pg_port = self._entry("5432")
+        self.pg_user = self._entry("kalliopen")
+        self.pg_password = self._entry(""); self.pg_password.set_visibility(False)
+        self.pg_database = self._entry("kalliopen")
+        self.pg_schema = self._entry("public")
+        for row, label, entry in (
+            (0, "Host", self.pg_host), (1, "Port", self.pg_port),
+            (2, "User", self.pg_user), (3, "Password", self.pg_password),
+            (4, "Database", self.pg_database), (5, "Schema", self.pg_schema),
+        ):
+            self.pg_fields.attach(Gtk.Label(label=label, xalign=0), 0, row, 1, 1)
+            self.pg_fields.attach(entry, 1, row, 1, 1)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        body.set_margin_top(24); body.set_margin_bottom(24)
+        body.set_margin_start(28); body.set_margin_end(28)
+        body.append(Gtk.Label(label="Source files", xalign=0, css_classes=["title-3"]))
+        self.mdf_button = Gtk.Button(label="Select MDF data file")
+        self.mdf_button.connect("clicked", lambda *_: self.select_file("mdf"))
+        self.ldf_button = Gtk.Button(label="Select log file")
+        self.ldf_button.connect("clicked", lambda *_: self.select_file("ldf"))
+        body.append(self.mdf_button); body.append(self.ldf_button)
+        body.append(Gtk.Label(label="Original SQL Server version", xalign=0))
+        body.append(self.version)
+        body.append(self.custom_postgres)
+        body.append(self.pg_fields)
+        body.append(self.status); body.append(self.report_scroll)
+        self.prepare = Gtk.Button(label="Prepare preview")
+        self.prepare.add_css_class("suggested-action")
+        self.prepare.connect("clicked", self.prepare_preview)
+        self.commit = Gtk.Button(label="Confirm and import")
+        self.commit.add_css_class("destructive-action")
+        self.commit.set_sensitive(False)
+        self.commit.connect("clicked", self.confirm_import)
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        actions.append(self.prepare); actions.append(self.commit)
+        body.append(actions)
+        self.set_child(body)
+        self.connect("close-request", self.close_session)
+
+    def select_file(self, kind: str):
+        logger.info("Migration file selection opened for %s", kind.upper())
+        dialog = Gtk.FileDialog(title="Select ps-biblio source file")
+        dialog.open(self, None, lambda d, result: self.file_selected(d, result, kind))
+
+    def file_selected(self, dialog, result, kind: str):
+        try:
+            path = dialog.open_finish(result).get_path()
+        except GLib.Error:
+            return
+        if kind == "mdf":
+            self.mdf_path = path
+            self.mdf_button.set_label(Path(path).name)
+        else:
+            self.ldf_path = path
+            self.ldf_button.set_label(Path(path).name)
+        logger.info("Migration %s selected: %s", kind.upper(), path)
+
+    def prepare_preview(self, *_):
+        if not self.mdf_path or not self.ldf_path:
+            self.status.set_text("Select both the MDF data file and transaction log first.")
+            return
+        version = source_versions()[self.version.get_active()]
+        logger.info("Migration preview requested")
+        self.prepare.set_sensitive(False)
+        self.status.set_text("Reading source data and preparing migration preview...")
+
+        def worker():
+            try:
+                self.session = MigrationSession.create(self.mdf_path, self.ldf_path, version)
+                plan = self.session.prepare_preview()
+                message = "Preview ready. Confirming import creates a backup, resets the database, runs schema migrations, and imports this data."
+                GLib.idle_add(self.set_preview, plan, message)
+            except Exception as exc:
+                GLib.idle_add(self.preview_failed, str(exc))
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _entry(value: str) -> Gtk.Entry:
+        entry = Gtk.Entry()
+        entry.set_text(value)
+        entry.set_hexpand(True)
+        return entry
+
+    def postgres_config(self) -> PostgresConfig | None:
+        if not self.custom_postgres.get_active():
+            return None
+        try:
+            port = int(self.pg_port.get_text().strip())
+            if not 1 <= port <= 65535:
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError("PostgreSQL port must be between 1 and 65535.") from exc
+        values = [self.pg_host, self.pg_user, self.pg_password, self.pg_database, self.pg_schema]
+        if any(not field.get_text().strip() for field in values):
+            raise ValueError("All custom PostgreSQL fields are required.")
+        return PostgresConfig(
+            host=self.pg_host.get_text().strip(), port=port,
+            user=self.pg_user.get_text().strip(), password=self.pg_password.get_text(),
+            database=self.pg_database.get_text().strip(), schema=self.pg_schema.get_text().strip(),
+        )
+
+    def set_preview(self, plan, message):
+        lines = ["SOURCE ROWS"]
+        lines.extend(f"  {label:<18} {count:>8,}" for label, count in plan.source_counts.items())
+        lines.extend(("", "ROWS TO IMPORT"))
+        lines.extend(f"  {label:<18} {count:>8,}" for label, count in plan.record_counts.items())
+        lines.extend(("", "SKIPPED OR ADJUSTED"))
+        if plan.skipped:
+            lines.extend(f"  {label}: {count:,}" for label, count in plan.skipped.items())
+        else:
+            lines.append("  None")
+        self.set_report("\n".join(lines))
+        self.status.set_text(message)
+        self.commit.set_sensitive(True)
+
+    def preview_failed(self, message):
+        self.status.set_text("Could not prepare the migration preview.")
+        self.show_error("Migration preview failed", message)
+        self.prepare.set_sensitive(True)
+
+    def set_report(self, text: str):
+        self.report.get_buffer().set_text(text)
+        self.report_scroll.set_visible(True)
+
+    def show_error(self, title: str, message: str):
+        logger.error("%s: %s", title, message)
+        dialog = Gtk.AlertDialog(message=title, detail=message, buttons=["Close"])
+        dialog.show(self)
+
+    def confirm_import(self, *_):
+        logger.info("Migration import confirmation requested")
+        try:
+            postgres = self.postgres_config()
+        except ValueError as exc:
+            self.status.set_text("Check the custom PostgreSQL connection details.")
+            self.show_error("Invalid PostgreSQL configuration", str(exc))
+            return
+        self.target_config = postgres
+        message = (
+            "Import into the custom PostgreSQL target? The target must already contain the empty KalliOpen schema."
+            if self.target_config is not None
+            else "Import the previewed data? The local database will first be backed up and then replaced."
+        )
+        dialog = Gtk.AlertDialog(
+            message=message,
+            buttons=["Cancel", "Import"],
+        )
+        dialog.choose(self, None, self.import_confirmed)
+
+    def import_confirmed(self, dialog, result):
+        if dialog.choose_finish(result) != 1:
+            logger.info("Migration import cancelled")
+            return
+        logger.info("Migration import confirmed")
+        self.commit.set_sensitive(False)
+        self.status.set_text("Backing up, resetting, migrating schema, and importing data...")
+
+        def worker():
+            try:
+                assert self.session is not None
+                backup = self.session.commit(self.target_config)
+                GLib.idle_add(self.import_finished, backup)
+            except Exception as exc:
+                GLib.idle_add(self.import_failed, str(exc))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def import_finished(self, backup):
+        detail = (
+            f"A backup of the previous local database was saved to:\n{backup}"
+            if backup else "The custom PostgreSQL target was imported successfully."
+        )
+        self.close()
+        dialog = Gtk.AlertDialog(
+            message="Migration completed successfully",
+            detail=detail,
+            buttons=["Done"],
+        )
+        dialog.show(self.parent_window)
+
+    def import_failed(self, message):
+        self.status.set_text("Migration failed. Correct the connection details if necessary and try again.")
+        self.commit.set_sensitive(True)
+        self.show_error("Migration failed", message)
+
+    def close_session(self, *_):
+        logger.info("Migration dialog closed")
+        if self.session:
+            threading.Thread(target=self.session.close, daemon=True).start()
+        return False
+
+
+class Window(Gtk.ApplicationWindow):
+    def __init__(self, app: Gtk.Application):
+        super().__init__(application=app, title="KalliOpen Launcher")
+        self.connect("close-request", self.close_application)
+        self.state = config.ensure_state()
+        self.last_state = "stopped"
+        self.transition: str | None = None
+        self._install_css()
+        self.status_dot = Gtk.Label(label="●")
+        self.status_dot.add_css_class("status-dot")
+        self.status = Gtk.Label(xalign=0)
+        self.status.add_css_class("status-value")
+        self.current_version = Gtk.Label(label="Not installed", xalign=0)
+        self.latest_version = Gtk.Label(label="Checking...", xalign=0)
+        self.action = Gtk.Button(label="Start")
+        self.action.add_css_class("suggested-action")
+        self.action.connect("clicked", self.toggle)
+        open_button = Gtk.Button(label="Open KalliOpen")
+        open_button.connect("clicked", self.open_kalliopen)
+        migrate = Gtk.Button(label="Migration")
+        migrate.connect("clicked", self.show_migration)
+        export = Gtk.Button(label="Export database")
+        export.connect("clicked", self.export_db)
+        import_button = Gtk.Button(label="Import database")
+        import_button.connect("clicked", self.import_db)
+        delete_button = Gtk.Button(label="Delete database")
+        delete_button.add_css_class("destructive-action")
+        delete_button.connect("clicked", self.delete_db)
+        self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self.body.set_margin_top(28); self.body.set_margin_bottom(28)
+        self.body.set_margin_start(36); self.body.set_margin_end(36)
+        status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=9)
+        status_row.set_halign(Gtk.Align.START)
+        status_row.append(self.status_dot)
+        status_row.append(self.status)
+        self.body.append(status_row)
+        info = Gtk.Grid(column_spacing=28, row_spacing=4)
+        info.add_css_class("info-grid")
+        info.attach(Gtk.Label(label="Address", xalign=0, css_classes=["info-label"]), 0, 0, 1, 1)
+        info.attach(Gtk.Label(label=f"{docker.local_ip()}:80", xalign=0), 0, 1, 1, 1)
+        info.attach(Gtk.Label(label="Current version", xalign=0, css_classes=["info-label"]), 1, 0, 1, 1)
+        info.attach(self.current_version, 1, 1, 1, 1)
+        info.attach(Gtk.Label(label="Latest version", xalign=0, css_classes=["info-label"]), 2, 0, 1, 1)
+        info.attach(self.latest_version, 2, 1, 1, 1)
+        self.body.append(info)
+        service_actions = Gtk.Grid(column_spacing=12)
+        service_actions.set_hexpand(True)
+        service_actions.attach(self.action, 0, 0, 1, 1)
+        update = Gtk.Button(label="Update")
+        update.connect("clicked", self.update_kalliopen)
+        update.set_sensitive(False)
+        self.update_button = update
+        service_actions.attach(update, 1, 0, 1, 1)
+        service_actions.set_column_homogeneous(True)
+        self.body.append(service_actions)
+        self.body.append(open_button)
+        self.body.append(Gtk.Separator())
+        self.body.append(Gtk.Label(label="Database tools", xalign=0, css_classes=["section-label"]))
+        database_tools = Gtk.Grid(column_spacing=12, row_spacing=12)
+        database_tools.set_column_homogeneous(True)
+        database_tools.attach(export, 0, 0, 1, 1)
+        database_tools.attach(import_button, 1, 0, 1, 1)
+        database_tools.attach(migrate, 0, 1, 1, 1)
+        database_tools.attach(delete_button, 1, 1, 1, 1)
+        self.body.append(database_tools)
+        self.setup = Gtk.Button(label="Run setup")
+        self.setup.connect("clicked", self.run_setup)
+        self.setup.set_visible(not docker.installed())
+        self.body.append(self.setup)
+        self.set_child(self.body)
+        self.refresh()
+        self.refresh_versions()
+        GLib.timeout_add_seconds(5, self.refresh)
+
+    def close_application(self, *_):
+        logger.info("Main window closed; quitting application")
+        application = self.get_application()
+        if application:
+            application.quit()
+        return False
+
+    def refresh(self):
+        observed = docker.health()
+        if self.transition == "stopping":
+            state = "stopping" if observed != "stopped" else "stopped"
+            if state == "stopped":
+                self.transition = None
+        elif self.transition == "starting":
+            state = "starting" if observed != "running" else "running"
+            if state == "running":
+                self.transition = None
+        elif observed == "starting" and self.last_state in {"running", "unhealthy"}:
+            state = "unhealthy"
+        else:
+            state = observed
+        self.status.set_text({"running": "Running", "starting": "Starting", "stopped": "Stopped", "unhealthy": "Unhealthy"}.get(state, state.title()))
+        self.status_dot.set_css_classes(["status-dot", f"status-{state}"])
+        self.action.set_label("Stop" if state in {"running", "starting", "stopping"} else "Start")
+        self.action.set_sensitive(docker.installed() and state != "stopping")
+        self.setup.set_visible(not docker.installed())
+        self.last_state = state
+        return True
+
+    def refresh_versions(self):
+        logger.info("Checking application image versions")
+        def worker():
+            current, latest, current_digest, latest_digest = docker.image_versions()
+            GLib.idle_add(self._set_versions, current, latest, current_digest, latest_digest)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _set_versions(self, current, latest, current_digest, latest_digest):
+        self.current_version.set_text(self._version_text(current, "Not installed"))
+        self.latest_version.set_text(self._version_text(latest, "Unavailable"))
+        self.update_button.set_sensitive(bool(current_digest and latest_digest and current_digest != latest_digest))
+
+    @staticmethod
+    def _version_text(value, fallback):
+        return value.removeprefix("sha256:")[:12] if value else fallback
+
+    def run_async(self, fn, success="Done"):
+        logger.info("Starting background action: %s", success)
+        def worker():
+            try: fn(); message = success
+            except Exception as exc:
+                logger.exception("Background action failed")
+                message = str(exc)
+            else:
+                logger.info("Background action completed: %s", success)
+            GLib.idle_add(self.refresh)
+            GLib.idle_add(self.refresh_versions)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def toggle(self, *_):
+        if docker.health() in {"running", "starting"}:
+            logger.info("Stop button pressed")
+            self.transition = "stopping"
+            self.refresh()
+            self.run_async(lambda: docker.compose("down"), "Stopped")
+        else:
+            logger.info("Start button pressed")
+            self.transition = "starting"
+            self.refresh()
+            self.run_async(lambda: docker.compose("up", "-d"), "Starting KalliOpen")
+
+    def open_kalliopen(self, *_):
+        logger.info("Open KalliOpen button pressed")
+        webbrowser.open("http://localhost")
+
+    def update_kalliopen(self, *_):
+        logger.info("Update button pressed")
+        self.confirm("Update KalliOpen and run database migrations?", lambda: self.run_async(docker.update, "Updated"))
+
+    def confirm(self, text: str, callback):
+        dialog = Gtk.AlertDialog(message=text, buttons=["Cancel", "Continue"])
+        dialog.choose(self, None, lambda d, result: callback() if d.choose_finish(result) == 1 else None)
+
+    def export_db(self, *_):
+        logger.info("Export database button pressed")
+        dialog = Gtk.FileDialog(title="Choose export folder")
+        dialog.select_folder(self, None, lambda d, result: self._export_finish(d, result))
+
+    def _export_finish(self, dialog, result):
+        try: folder = dialog.select_folder_finish(result).get_path()
+        except GLib.Error: return
+        destination = Path(folder) / docker.automatic_backup_path("kalliopen").name
+        self.run_async(lambda: docker.export_database(destination), f"Database exported to {destination}")
+
+    def import_db(self, *_):
+        logger.info("Import database button pressed")
+        dialog = Gtk.FileDialog(title="Import database backup")
+        dialog.open(self, None, lambda d, result: self._import_finish(d, result))
+
+    def _import_finish(self, dialog, result):
+        try: path = dialog.open_finish(result).get_path()
+        except GLib.Error: return
+        self.confirm("Importing replaces the current database. A backup will be made first.",
+                     lambda: self.run_async(lambda: docker.import_database(Path(path)), "Database imported"))
+
+    def delete_db(self, *_):
+        logger.info("Delete database button pressed")
+        self.confirm("Delete all KalliOpen database data? This cannot be undone.",
+                     lambda: self.run_async(docker.delete_database, "Database deleted"))
+
+    def run_setup(self, *_):
+        logger.info("Docker setup button pressed")
+        def setup():
+            if not docker.available(): docker.install()
+            docker.compose("pull")
+            docker.compose("up", "-d")
+        self.run_async(setup, "Setup complete")
+
+    def show_migration(self, *_):
+        logger.info("Migration button pressed")
+        MigrationDialog(self).present()
+
+    def _install_css(self):
+        css = Gtk.CssProvider()
+        css.load_from_data(b"""
+        .status-value { font-size: 27px; font-weight: 700; }
+        .status-dot { font-size: 22px; }
+        .status-stopped { color: #d83a3a; }
+        .status-starting, .status-unhealthy, .status-stopping { color: #d98d00; }
+        .status-running { color: #2f9e44; }
+        .section-label { font-weight: 700; margin-top: 4px; }
+        .info-grid { margin-top: 5px; margin-bottom: 2px; }
+        .info-label { font-size: 12px; font-weight: 700; color: #6b6b6b; }
+        button { min-height: 38px; }
+        """)
+        Gtk.StyleContext.add_provider_for_display(self.get_display(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+
+class App(Gtk.Application):
+    def __init__(self): super().__init__(application_id="io.kalliopen.Launcher", flags=Gio.ApplicationFlags.FLAGS_NONE)
+    def do_activate(self): Window(self).present()
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    return App().run(None)

@@ -1,0 +1,10 @@
+#!/usr/bin/make -f
+
+%:
+	 dh $@ --with python3 --buildsystem=pybuild
+
+override_dh_auto_install:
+	 dh_auto_install
+	 install -Dm755 packaging/io.kalliopen.Launcher.desktop debian/kalliopen-launcher/usr/share/applications/io.kalliopen.Launcher.desktop
+	 install -Dm644 packaging/io.kalliopen.Launcher.autostart debian/kalliopen-launcher/etc/xdg/autostart/io.kalliopen.Launcher.desktop
+	 install -Dm644 logo.svg debian/kalliopen-launcher/usr/share/icons/hicolor/scalable/apps/io.kalliopen.Launcher.svg

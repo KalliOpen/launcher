@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=KalliOpen Launcher
+Comment=Manage the local KalliOpen instance
+Exec=kalliopen-launcher
+Icon=io.kalliopen.Launcher
+Terminal=false
+Type=Application
+Categories=Utility;
