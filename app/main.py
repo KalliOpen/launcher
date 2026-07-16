@@ -305,7 +305,7 @@ class Window(Gtk.ApplicationWindow):
         self.body.append(database_tools)
         self.setup = Gtk.Button(label="Run setup")
         self.setup.connect("clicked", self.run_setup)
-        self.setup.set_visible(not docker.installed())
+        self.update_docker_controls()
         self.body.append(self.setup)
         self.set_child(self.body)
         self.refresh()
@@ -336,8 +336,8 @@ class Window(Gtk.ApplicationWindow):
         self.status.set_text({"running": "Running", "starting": "Starting", "stopped": "Stopped", "unhealthy": "Unhealthy"}.get(state, state.title()))
         self.status_dot.set_css_classes(["status-dot", f"status-{state}"])
         self.action.set_label("Stop" if state in {"running", "starting", "stopping"} else "Start")
-        self.action.set_sensitive(docker.installed() and state != "stopping")
-        self.setup.set_visible(not docker.installed())
+        self.action.set_sensitive(docker.available() and state != "stopping")
+        self.update_docker_controls()
         self.last_state = state
         return True
 
@@ -364,11 +364,20 @@ class Window(Gtk.ApplicationWindow):
             except Exception as exc:
                 logger.exception("Background action failed")
                 message = str(exc)
+                GLib.idle_add(self.show_background_error, message)
             else:
                 logger.info("Background action completed: %s", success)
             GLib.idle_add(self.refresh)
             GLib.idle_add(self.refresh_versions)
         threading.Thread(target=worker, daemon=True).start()
+
+    def show_background_error(self, message):
+        dialog = Gtk.AlertDialog(
+            message="KalliOpen operation failed",
+            detail=message,
+            buttons=["Close"],
+        )
+        dialog.show(self)
 
     def toggle(self, *_):
         if docker.health() in {"running", "starting"}:
@@ -424,10 +433,15 @@ class Window(Gtk.ApplicationWindow):
     def run_setup(self, *_):
         logger.info("Docker setup button pressed")
         def setup():
-            if not docker.available(): docker.install()
+            docker.configure()
             docker.compose("pull")
             docker.start()
         self.run_async(setup, "Setup complete")
+
+    def update_docker_controls(self):
+        ready = docker.available()
+        self.setup.set_visible(not ready)
+        self.setup.set_label("Configure Docker" if docker.installed() else "Install Docker")
 
     def show_migration(self, *_):
         logger.info("Migration button pressed")

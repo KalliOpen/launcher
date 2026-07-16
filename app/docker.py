@@ -9,6 +9,8 @@ import logging
 from datetime import datetime
 import time
 import re
+import os
+import pwd
 from pathlib import Path
 
 from . import config
@@ -26,6 +28,25 @@ def installed() -> bool:
     return shutil.which("docker") is not None
 
 
+def configure() -> None:
+    if not installed():
+        install()
+    logger.info("Enabling the Docker service")
+    subprocess.run(["pkexec", "systemctl", "enable", "--now", "docker"], check=True)
+    if available():
+        return
+    result = subprocess.run(["docker", "info"], capture_output=True, text=True)
+    detail = (result.stderr or result.stdout).strip()
+    if "permission denied" in detail.lower() or "docker.sock" in detail.lower():
+        username = pwd.getpwuid(os.getuid()).pw_name
+        logger.info("Adding user %s to the Docker group", username)
+        subprocess.run(["pkexec", "usermod", "-aG", "docker", username], check=True)
+        raise RuntimeError(
+            "Docker access has been configured. Log out of Linux Mint and log back in, then reopen KalliOpen Launcher."
+        )
+    raise RuntimeError(detail or "Docker is installed but unavailable.")
+
+
 def install() -> None:
     logger.info("Installing Docker and Docker Compose")
     subprocess.run(["pkexec", "apt-get", "update"], check=True)
@@ -36,8 +57,14 @@ def compose(*args: str, capture: bool = True, log: bool = True) -> subprocess.Co
     config.write_compose(config.ensure_state())
     if log:
         logger.info("Running Docker Compose: %s", " ".join(args))
-    return subprocess.run(["docker", "compose", "-f", str(config.COMPOSE_FILE), *args],
-                          capture_output=capture, text=True, check=True)
+    result = subprocess.run(
+        ["docker", "compose", "-f", str(config.COMPOSE_FILE), *args],
+        capture_output=capture, text=True,
+    )
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "Docker Compose command failed.").strip()
+        raise RuntimeError(detail)
+    return result
 
 
 def health() -> str:
@@ -157,10 +184,20 @@ def image_versions() -> tuple[str | None, str | None, str | None, str | None]:
         tags = _registry_tags(registry, repository, token)
         version_tags = [item for item in tags if _is_version_tag(item)]
         latest_version = max(version_tags, key=_version_key) if version_tags else tag
-        latest = _manifest_digest(registry, repository, latest_version, token)
-        configured_digest = _manifest_digest(registry, repository, tag, token)
+        latest_digests = _manifest_digests(registry, repository, latest_version, token)
+        latest = current if current in latest_digests else next(iter(latest_digests), None)
+        configured_digests = _manifest_digests(registry, repository, tag, token)
         if current_version is None:
-            current_version = latest_version if current == configured_digest else tag
+            matching_tags = [
+                item for item in version_tags
+                if current in _manifest_digests(registry, repository, item, token)
+            ] if current else []
+            if matching_tags:
+                current_version = max(matching_tags, key=_version_key)
+            elif current in configured_digests and latest_version == tag:
+                current_version = latest_version
+            elif current:
+                current_version = "Unknown"
     except (OSError, KeyError, ValueError):
         latest = None
         latest_version = None
@@ -183,17 +220,21 @@ def _registry_tags(registry: str, repository: str, token: str) -> list[str]:
         return json.loads(response.read()).get("tags", [])
 
 
-def _manifest_digest(registry: str, repository: str, tag: str, token: str) -> str | None:
+def _manifest_digests(registry: str, repository: str, tag: str, token: str) -> set[str]:
     request = urllib.request.Request(
         f"https://{registry}/v2/{repository}/manifests/{tag}",
         headers={
             "Accept": "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json",
             "Authorization": f"Bearer {token}",
         },
-        method="HEAD",
     )
     with urllib.request.urlopen(request, timeout=5) as response:
-        return response.headers.get("Docker-Content-Digest")
+        payload = json.loads(response.read())
+        digests = {item["digest"] for item in payload.get("manifests", []) if item.get("digest")}
+        header_digest = response.headers.get("Docker-Content-Digest")
+        if header_digest:
+            digests.add(header_digest)
+        return digests
 
 
 def _is_version_tag(tag: str) -> bool:
