@@ -14,6 +14,7 @@ from .migration_workflow import MigrationSession, source_versions
 from .migrator.postgres import PostgresConfig
 
 logger = logging.getLogger(__name__)
+MANAGED_LIFECYCLE_VERSION = 1
 
 
 class MigrationDialog(Gtk.Window):
@@ -203,6 +204,8 @@ class MigrationDialog(Gtk.Window):
         logger.info("Migration import confirmed")
         self.commit.set_sensitive(False)
         self.status.set_text("Backing up, resetting, migrating schema, and importing data...")
+        if self.target_config is None:
+            self.parent_window.begin_managed_restart()
 
         def worker():
             try:
@@ -218,6 +221,8 @@ class MigrationDialog(Gtk.Window):
             f"A backup of the previous local database was saved to:\n{backup}"
             if backup else "The custom PostgreSQL target was imported successfully."
         )
+        if backup is not None:
+            self.parent_window.managed_service_started()
         self.close()
         dialog = Gtk.AlertDialog(
             message="Migration completed successfully",
@@ -229,6 +234,8 @@ class MigrationDialog(Gtk.Window):
     def import_failed(self, message):
         self.status.set_text("Migration failed. Correct the connection details if necessary and try again.")
         self.commit.set_sensitive(True)
+        if self.target_config is None:
+            self.parent_window.managed_action_failed()
         self.show_error("Migration failed", message)
 
     def close_session(self, *_):
@@ -244,7 +251,10 @@ class Window(Gtk.ApplicationWindow):
         self.connect("close-request", self.close_application)
         self.state = config.ensure_state()
         self.last_state = "stopped"
+        self.has_been_healthy = bool(self.state.get("ever_healthy", False))
         self.transition: str | None = None
+        self.autostart_pending = True
+        self.initialize_service_state()
         self._install_css()
         self.status_dot = Gtk.Label(label="●")
         self.status_dot.add_css_class("status-dot")
@@ -255,8 +265,8 @@ class Window(Gtk.ApplicationWindow):
         self.action = Gtk.Button(label="Start")
         self.action.add_css_class("suggested-action")
         self.action.connect("clicked", self.toggle)
-        open_button = Gtk.Button(label="Open KalliOpen")
-        open_button.connect("clicked", self.open_kalliopen)
+        self.open_button = Gtk.Button(label="Open KalliOpen")
+        self.open_button.connect("clicked", self.open_kalliopen)
         migrate = Gtk.Button(label="Migration")
         migrate.connect("clicked", self.show_migration)
         export = Gtk.Button(label="Export database")
@@ -277,7 +287,8 @@ class Window(Gtk.ApplicationWindow):
         info = Gtk.Grid(column_spacing=28, row_spacing=4)
         info.add_css_class("info-grid")
         info.attach(Gtk.Label(label="Address", xalign=0, css_classes=["info-label"]), 0, 0, 1, 1)
-        info.attach(Gtk.Label(label=f"{docker.local_ip()}:80", xalign=0), 0, 1, 1, 1)
+        self.address = Gtk.Label(label=self.address_text(), xalign=0)
+        info.attach(self.address, 0, 1, 1, 1)
         info.attach(Gtk.Label(label="Current version", xalign=0, css_classes=["info-label"]), 1, 0, 1, 1)
         info.attach(self.current_version, 1, 1, 1, 1)
         info.attach(Gtk.Label(label="Latest version", xalign=0, css_classes=["info-label"]), 2, 0, 1, 1)
@@ -293,7 +304,7 @@ class Window(Gtk.ApplicationWindow):
         service_actions.attach(update, 1, 0, 1, 1)
         service_actions.set_column_homogeneous(True)
         self.body.append(service_actions)
-        self.body.append(open_button)
+        self.body.append(self.open_button)
         self.body.append(Gtk.Separator())
         self.body.append(Gtk.Label(label="Database tools", xalign=0, css_classes=["section-label"]))
         database_tools = Gtk.Grid(column_spacing=12, row_spacing=12)
@@ -311,6 +322,69 @@ class Window(Gtk.ApplicationWindow):
         self.refresh()
         self.refresh_versions()
         GLib.timeout_add_seconds(5, self.refresh)
+        GLib.timeout_add_seconds(2, self.autostart_managed_service)
+
+    @staticmethod
+    def address_text() -> str:
+        return docker.application_url().removeprefix("http://")
+
+    def initialize_service_state(self) -> None:
+        if not docker.available():
+            return
+        existing_install = docker.managed_install_exists()
+        changed = False
+        if existing_install and not self.state.get("setup_complete"):
+            self.state["setup_complete"] = True
+            changed = True
+        if "desired_running" not in self.state:
+            self.state["desired_running"] = existing_install and docker.app_container_running()
+            changed = True
+        if "managed_lifecycle_version" not in self.state:
+            self.state["managed_lifecycle_version"] = 0 if existing_install else MANAGED_LIFECYCLE_VERSION
+            changed = True
+        if changed:
+            config.save(self.state)
+
+    def set_service_state(self, **changes) -> None:
+        self.state.update(changes)
+        config.save(self.state)
+
+    def begin_managed_restart(self) -> None:
+        self.autostart_pending = False
+        self.set_service_state(desired_running=True)
+        self.transition = "starting"
+        self.refresh()
+
+    def managed_service_started(self) -> None:
+        self.set_service_state(
+            setup_complete=True,
+            desired_running=True,
+            managed_lifecycle_version=MANAGED_LIFECYCLE_VERSION,
+        )
+
+    def managed_action_failed(self) -> None:
+        self.transition = None
+
+    def autostart_managed_service(self) -> bool:
+        if not self.autostart_pending:
+            return False
+        if not docker.available():
+            return True
+        self.initialize_service_state()
+        self.autostart_pending = False
+        configured = self.state.get("setup_complete", False)
+        desired = self.state.get("desired_running", False)
+        lifecycle_current = self.state.get("managed_lifecycle_version") == MANAGED_LIFECYCLE_VERSION
+        if configured and desired and (docker.health() != "running" or not lifecycle_current):
+            logger.info("Starting configured KalliOpen service during launcher autostart")
+            self.begin_managed_restart()
+            self.run_async(
+                docker.start,
+                "KalliOpen started automatically",
+                on_success=self.managed_service_started,
+                on_failure=self.managed_action_failed,
+            )
+        return False
 
     def close_application(self, *_):
         logger.info("Main window closed; quitting application")
@@ -329,14 +403,24 @@ class Window(Gtk.ApplicationWindow):
             state = "starting" if observed != "running" else "running"
             if state == "running":
                 self.transition = None
-        elif observed == "starting" and self.last_state in {"running", "unhealthy"}:
+        elif observed == "running":
+            state = "running"
+        elif observed == "stopped" and not self.state.get("desired_running", False):
+            state = "stopped"
+        elif self.has_been_healthy:
             state = "unhealthy"
         else:
             state = observed
+        if state == "running":
+            if not self.has_been_healthy:
+                self.has_been_healthy = True
+                self.set_service_state(ever_healthy=True)
         self.status.set_text({"running": "Running", "starting": "Starting", "stopped": "Stopped", "unhealthy": "Unhealthy"}.get(state, state.title()))
         self.status_dot.set_css_classes(["status-dot", f"status-{state}"])
         self.action.set_label("Stop" if state in {"running", "starting", "stopping"} else "Start")
         self.action.set_sensitive(docker.available() and state != "stopping")
+        self.open_button.set_sensitive(state == "running")
+        self.address.set_text(self.address_text())
         self.update_docker_controls()
         self.last_state = state
         return True
@@ -357,19 +441,27 @@ class Window(Gtk.ApplicationWindow):
     def _version_text(value, fallback):
         return value.removeprefix("sha256:")[:12] if value else fallback
 
-    def run_async(self, fn, success="Done"):
+    def run_async(self, fn, success="Done", on_success=None, on_failure=None):
         logger.info("Starting background action: %s", success)
         def worker():
-            try: fn(); message = success
+            try:
+                fn()
             except Exception as exc:
                 logger.exception("Background action failed")
-                message = str(exc)
-                GLib.idle_add(self.show_background_error, message)
+                GLib.idle_add(self.finish_background_action, False, str(exc), on_failure)
             else:
                 logger.info("Background action completed: %s", success)
-            GLib.idle_add(self.refresh)
-            GLib.idle_add(self.refresh_versions)
+                GLib.idle_add(self.finish_background_action, True, success, on_success)
         threading.Thread(target=worker, daemon=True).start()
+
+    def finish_background_action(self, succeeded, message, callback):
+        if callback:
+            callback()
+        if not succeeded:
+            self.show_background_error(message)
+        self.refresh()
+        self.refresh_versions()
+        return False
 
     def show_background_error(self, message):
         dialog = Gtk.AlertDialog(
@@ -380,24 +472,49 @@ class Window(Gtk.ApplicationWindow):
         dialog.show(self)
 
     def toggle(self, *_):
-        if docker.health() in {"running", "starting"}:
+        if self.last_state in {"running", "starting", "stopping"}:
             logger.info("Stop button pressed")
+            self.set_service_state(desired_running=False)
             self.transition = "stopping"
             self.refresh()
-            self.run_async(lambda: docker.compose("down"), "Stopped")
+            self.run_async(
+                lambda: docker.compose("down"),
+                "Stopped",
+                on_failure=self.stop_action_failed,
+            )
         else:
             logger.info("Start button pressed")
-            self.transition = "starting"
-            self.refresh()
-            self.run_async(docker.start, "Starting KalliOpen")
+            self.start_managed_service("Starting KalliOpen")
+
+    def start_managed_service(self, message="Starting KalliOpen"):
+        self.begin_managed_restart()
+        self.run_async(
+            docker.start,
+            message,
+            on_success=self.managed_service_started,
+            on_failure=self.managed_action_failed,
+        )
+
+    def stop_action_failed(self):
+        self.set_service_state(desired_running=True)
+        self.transition = None
 
     def open_kalliopen(self, *_):
         logger.info("Open KalliOpen button pressed")
-        webbrowser.open("http://localhost")
+        webbrowser.open(docker.application_url())
 
     def update_kalliopen(self, *_):
         logger.info("Update button pressed")
-        self.confirm("Update KalliOpen and run database migrations?", lambda: self.run_async(docker.update, "Updated"))
+        self.confirm("Update KalliOpen and run database migrations?", self.run_update)
+
+    def run_update(self):
+        self.begin_managed_restart()
+        self.run_async(
+            docker.update,
+            "Updated",
+            on_success=self.managed_service_started,
+            on_failure=self.managed_action_failed,
+        )
 
     def confirm(self, text: str, callback):
         dialog = Gtk.AlertDialog(message=text, buttons=["Cancel", "Continue"])
@@ -423,12 +540,30 @@ class Window(Gtk.ApplicationWindow):
         try: path = dialog.open_finish(result).get_path()
         except GLib.Error: return
         self.confirm("Importing replaces the current database. A backup will be made first.",
-                     lambda: self.run_async(lambda: docker.import_database(Path(path)), "Database imported"))
+                     lambda: self.run_database_import(Path(path)))
+
+    def run_database_import(self, path: Path):
+        self.begin_managed_restart()
+        self.run_async(
+            lambda: docker.import_database(path),
+            "Database imported",
+            on_success=self.managed_service_started,
+            on_failure=self.managed_action_failed,
+        )
 
     def delete_db(self, *_):
         logger.info("Delete database button pressed")
         self.confirm("Delete all KalliOpen database data? This cannot be undone.",
-                     lambda: self.run_async(docker.delete_database, "Database deleted"))
+                     self.run_database_delete)
+
+    def run_database_delete(self):
+        self.begin_managed_restart()
+        self.run_async(
+            docker.delete_database,
+            "Database deleted",
+            on_success=self.managed_service_started,
+            on_failure=self.managed_action_failed,
+        )
 
     def run_setup(self, *_):
         logger.info("Docker setup button pressed")
@@ -436,7 +571,13 @@ class Window(Gtk.ApplicationWindow):
             docker.configure()
             docker.compose("pull")
             docker.start()
-        self.run_async(setup, "Setup complete")
+        self.begin_managed_restart()
+        self.run_async(
+            setup,
+            "Setup complete",
+            on_success=self.managed_service_started,
+            on_failure=self.managed_action_failed,
+        )
 
     def update_docker_controls(self):
         ready = docker.available()
@@ -464,8 +605,14 @@ class Window(Gtk.ApplicationWindow):
 
 
 class App(Gtk.Application):
-    def __init__(self): super().__init__(application_id="io.kalliopen.Launcher", flags=Gio.ApplicationFlags.FLAGS_NONE)
-    def do_activate(self): Window(self).present()
+    def __init__(self):
+        super().__init__(application_id="io.kalliopen.Launcher", flags=Gio.ApplicationFlags.FLAGS_NONE)
+        self.window = None
+
+    def do_activate(self):
+        if self.window is None:
+            self.window = Window(self)
+        self.window.present()
 
 
 def main():

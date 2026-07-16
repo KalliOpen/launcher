@@ -54,7 +54,7 @@ def install() -> None:
 
 
 def compose(*args: str, capture: bool = True, log: bool = True) -> subprocess.CompletedProcess[str]:
-    config.write_compose(config.ensure_state())
+    config.write_compose(config.ensure_state(), application_url())
     if log:
         logger.info("Running Docker Compose: %s", " ".join(args))
     result = subprocess.run(
@@ -69,7 +69,7 @@ def compose(*args: str, capture: bool = True, log: bool = True) -> subprocess.Co
 
 def health() -> str:
     try:
-        result = urllib.request.urlopen("http://localhost/api/trpc/health", timeout=3)
+        result = urllib.request.urlopen(f"http://localhost:{config.APP_PORT}/api/trpc/health", timeout=3)
         return "running" if result.status == 200 and "ok" in result.read().decode().lower() else "starting"
     except Exception:
         try:
@@ -92,6 +92,27 @@ def local_ip() -> str:
             return "unavailable"
 
 
+def application_url() -> str:
+    host = local_ip()
+    if host == "unavailable" or host.startswith("127."):
+        host = "localhost"
+    return f"http://{host}:{config.APP_PORT}"
+
+
+def managed_install_exists() -> bool:
+    try:
+        return bool(compose("ps", "-a", "-q", log=False).stdout.strip())
+    except Exception:
+        return False
+
+
+def app_container_running() -> bool:
+    try:
+        return bool(compose("ps", "--status", "running", "-q", "app", log=False).stdout.strip())
+    except Exception:
+        return False
+
+
 def export_database(destination: Path) -> None:
     logger.info("Exporting database to %s", destination)
     ensure_database_running()
@@ -99,6 +120,7 @@ def export_database(destination: Path) -> None:
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     try:
         with temporary.open("wb") as output:
+            temporary.chmod(0o600)
             result = subprocess.run(
                 ["docker", "compose", "-f", str(config.COMPOSE_FILE), "exec", "-T", "db",
                  "pg_dump", "-U", "kalliopen", "-Fc", "kalliopen"],
@@ -107,12 +129,14 @@ def export_database(destination: Path) -> None:
         if result.returncode:
             raise RuntimeError(result.stderr.strip() or "PostgreSQL database export failed.")
         temporary.replace(destination)
+        destination.chmod(0o600)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
 
 
 def automatic_backup_path(reason: str) -> Path:
+    config.ensure_backup_directory()
     timestamp = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
     return config.BACKUP_DIR / f"{reason}_{timestamp}.dump"
 
@@ -131,34 +155,77 @@ def import_database(source: Path) -> None:
     logger.info("Importing database from %s", source)
     backup = automatic_backup_path("pre-import")
     export_database(backup)
-    with source.open("rb") as data:
-        subprocess.run(["docker", "compose", "-f", str(config.COMPOSE_FILE), "exec", "-T", "db",
-                        "pg_restore", "-U", "kalliopen", "-d", "kalliopen", "--clean", "--if-exists"],
-                       stdin=data, check=True)
+    stop_app()
+    try:
+        reset_database_schema()
+        with source.open("rb") as data:
+            command = [
+                "docker", "compose", "-f", str(config.COMPOSE_FILE), "exec", "-T", "db",
+                "pg_restore", "-U", "kalliopen", "-d", "kalliopen", "--clean", "--if-exists",
+                "--exit-on-error", "--single-transaction",
+            ]
+            result = subprocess.run(command, stdin=data, capture_output=True)
+        if result.returncode:
+            detail = (result.stderr or result.stdout).decode(errors="replace").strip()
+            raise RuntimeError(detail or "PostgreSQL database import failed.")
+        migrate()
+        start_app()
+    except Exception as exc:
+        raise RuntimeError(
+            f"{exc}\n\nThe previous database backup is saved at:\n{backup}\n\nKalliOpen remains stopped."
+        ) from exc
 
 
 def delete_database() -> None:
     logger.info("Deleting KalliOpen database schema")
+    stop_app()
+    ensure_database_running()
+    reset_database_schema()
+    migrate()
+    start_app()
+
+
+def reset_database_schema() -> None:
+    logger.info("Resetting KalliOpen database schema")
     compose("exec", "-T", "db", "psql", "-U", "kalliopen", "-d", "kalliopen", "-v",
             "ON_ERROR_STOP=1", "-c", "DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
 
 
 def migrate() -> None:
-    logger.info("Running application database migrations")
-    compose("exec", "-T", "app", "pnpm", "run", "db:migrate")
+    logger.info("Running KalliOpen migrator container")
+    compose("run", "--rm", "migrator")
+
+
+def stop_app() -> None:
+    logger.info("Stopping KalliOpen application container")
+    compose("stop", "app")
+
+
+def start_app() -> None:
+    logger.info("Starting KalliOpen application container")
+    compose("up", "-d", "app", "--no-deps")
+
+
+def prepare_empty_database() -> None:
+    logger.info("Preparing an empty migrated KalliOpen database")
+    stop_app()
+    ensure_database_running()
+    reset_database_schema()
+    migrate()
 
 
 def start() -> None:
     logger.info("Starting KalliOpen services and applying database migrations")
-    compose("up", "-d")
+    stop_app()
+    ensure_database_running()
     migrate()
+    start_app()
 
 
 def update() -> None:
     logger.info("Pulling and applying KalliOpen application update")
-    compose("pull", "app")
-    compose("up", "-d", "app")
-    migrate()
+    compose("pull", "app", "migrator")
+    start()
 
 
 def image_versions() -> tuple[str | None, str | None, str | None, str | None]:

@@ -8,7 +8,7 @@ Rules-Requires-Root: no
 
 Package: kalliopen-launcher
 Architecture: all
-Depends: ${python3:Depends}, ${misc:Depends}, python3-gi, gir1.2-gtk-4.0, docker.io, docker-compose-v2
+Depends: ${python3:Depends}, ${misc:Depends}, python3-gi, gir1.2-gtk-4.0, docker.io, docker-compose-v2, postgresql-client
 Description: KalliOpen local administration application
  GTK4 desktop application for installing, running, updating, backing up,
  and migrating a local KalliOpen instance.

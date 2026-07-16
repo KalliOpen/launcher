@@ -82,8 +82,7 @@ class MigrationSession:
                 logger.info("Backing up current database before migration")
                 backup = docker.automatic_backup_path("pre-migration")
                 docker.export_database(backup)
-                docker.delete_database()
-                docker.migrate()
+                docker.prepare_empty_database()
                 target = ContainerPostgresClient(PostgresConfig(
                     host="localhost", port=5432, user="kalliopen",
                     password=state["postgres_password"], database="kalliopen",
@@ -94,8 +93,17 @@ class MigrationSession:
             logger.info("Applying prepared PSBiblio migration plan")
             target.validate_target()
             target.apply(self.plan)
+            if postgres is None:
+                docker.start_app()
             logger.info("PSBiblio migration completed")
             return backup
+        except Exception as exc:
+            if backup is not None:
+                raise RuntimeError(
+                    f"{exc}\n\nThe previous database backup is saved at:\n{backup}"
+                    "\n\nKalliOpen remains stopped."
+                ) from exc
+            raise
         finally:
             logger.info("Removing temporary SQL Server container")
             self.container.remove()
