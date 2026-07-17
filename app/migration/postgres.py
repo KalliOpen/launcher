@@ -9,7 +9,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Iterable, Sequence
 
-from .migration import MigrationPlan
+from .plan import MigrationPlan
 from .mssql import CommandError, MigrationError
 
 

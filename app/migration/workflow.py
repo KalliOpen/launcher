@@ -6,9 +6,9 @@ import os
 import subprocess
 import logging
 
-from . import config, docker
-from .migrator.migration import MigrationPlan, build_migration_plan
-from .migrator.mssql import (
+from .. import config, docker
+from .plan import MigrationPlan, build_migration_plan
+from .mssql import (
     SOURCE_VERSION_IMAGES,
     SourceDatabase,
     SqlServerContainer,
@@ -16,7 +16,7 @@ from .migrator.mssql import (
     validate_database_file,
     validate_log_file,
 )
-from .migrator.postgres import PostgresClient, PostgresConfig
+from .postgres import PostgresClient, PostgresConfig
 
 logger = logging.getLogger(__name__)
 
