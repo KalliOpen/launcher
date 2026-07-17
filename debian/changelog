@@ -1,6 +1,7 @@
-kalliopen-launcher (0.1.0-1) unstable; urgency=low
+kalliopen-launcher (0.1.1-1) unstable; urgency=low
 
   * Initial release.
+  * Basic start, stop and update management of the Docker container.
   * Run database migrations through the dedicated kalliopen-migrator
     container before starting the application.
   * Keep the launcher available in the system tray when its window is closed.

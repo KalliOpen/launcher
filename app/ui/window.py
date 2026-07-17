@@ -40,7 +40,6 @@ class Window(Gtk.ApplicationWindow):
         self.current_version = Gtk.Label(label="Not installed", xalign=0)
         self.latest_version = Gtk.Label(label="Checking...", xalign=0)
         self.action = Gtk.Button(label="Start")
-        self.action.add_css_class("suggested-action")
         self.action.connect("clicked", self.toggle)
         self.open_button = Gtk.Button(label="Open KalliOpen")
         self.open_button.connect("clicked", self.open_kalliopen)
@@ -342,7 +341,9 @@ class Window(Gtk.ApplicationWindow):
                 self.set_service_state(ever_healthy=True)
         self.status.set_text({"running": "Running", "starting": "Starting", "stopped": "Stopped", "unhealthy": "Unhealthy"}.get(state, state.title()))
         self.status_dot.set_css_classes(["status-dot", f"status-{state}"])
-        self.action.set_label("Stop" if state in {"running", "starting", "stopping"} else "Start")
+        stopping = state in {"running", "starting", "stopping"}
+        self.action.set_label("Stop" if stopping else "Start")
+        self.action.set_css_classes(["action-stop" if stopping else "action-start"])
         self.action.set_sensitive(
             docker.available() and state != "stopping" and not self.automatic_backup_running
         )
@@ -542,6 +543,10 @@ class Window(Gtk.ApplicationWindow):
         .status-stopped { color: #d83a3a; }
         .status-starting, .status-unhealthy, .status-stopping { color: #d98d00; }
         .status-running { color: #2f9e44; }
+        button.action-start { background-color: #2f9e44; color: #ffffff; }
+        button.action-start:hover { background-color: #27863a; }
+        button.action-stop { background-color: #d83a3a; color: #ffffff; }
+        button.action-stop:hover { background-color: #bd3030; }
         .section-label { font-weight: 700; margin-top: 4px; }
         .info-grid { margin-top: 5px; margin-bottom: 2px; }
         .info-label { font-size: 12px; font-weight: 700; color: #6b6b6b; }

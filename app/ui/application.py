@@ -17,6 +17,13 @@ from .window import Window
 logger = logging.getLogger(__name__)
 
 
+def add_unix_signal(signum: signal.Signals, callback) -> int:
+    modern_signal_add = getattr(GLibUnix, "signal_add", None)
+    if modern_signal_add is not None:
+        return modern_signal_add(GLib.PRIORITY_DEFAULT, signum, callback)
+    return GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signum, callback)
+
+
 class App(Gtk.Application):
     def __init__(self):
         super().__init__(application_id="io.kalliopen.Launcher", flags=Gio.ApplicationFlags.FLAGS_NONE)
@@ -30,8 +37,8 @@ class App(Gtk.Application):
         Gtk.Application.do_startup(self)
         self.hold()
         self._held = True
-        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self.restore_window)
-        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, self.quit_from_tray)
+        add_unix_signal(signal.SIGUSR1, self.restore_window)
+        add_unix_signal(signal.SIGUSR2, self.quit_from_tray)
 
     def do_activate(self):
         if self.window is None:
