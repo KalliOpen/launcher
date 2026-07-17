@@ -1,7 +1,9 @@
-kalliopen-launcher (0.1.1-1) unstable; urgency=low
+kalliopen-launcher (0.1.0-1) unstable; urgency=low
 
   * Initial release.
   * Run database migrations through the dedicated kalliopen-migrator
     container before starting the application.
+  * Keep the launcher available in the system tray when its window is closed.
+  * Automatic periodic backups with retention policy.
 
  -- Skyslycer <noreply@skyslycer.de>  Thu, 16 Jul 2026 00:00:00 +0200

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
+import sys
 import threading
 import webbrowser
 import logging
@@ -8,7 +12,8 @@ from pathlib import Path
 
 import gi
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gtk, GLib, Gio
+gi.require_version("GLibUnix", "2.0")
+from gi.repository import Gtk, GLib, GLibUnix, Gio
 
 from . import backups, config, docker
 from .migration_workflow import MigrationSession, source_versions
@@ -291,6 +296,8 @@ class Window(Gtk.ApplicationWindow):
         self.body.append(status_row)
         info = Gtk.Grid(column_spacing=28, row_spacing=4)
         info.add_css_class("info-grid")
+        info.set_hexpand(True)
+        info.set_column_homogeneous(True)
         info.attach(Gtk.Label(label="Address", xalign=0, css_classes=["info-label"]), 0, 0, 1, 1)
         self.address = Gtk.Label(label=self.address_text(), xalign=0)
         info.attach(self.address, 0, 1, 1, 1)
@@ -357,8 +364,8 @@ class Window(Gtk.ApplicationWindow):
         self.automatic_backup_retention.set_width_chars(5)
         settings.attach(Gtk.Label(label="Every", xalign=0), 0, 0, 1, 1)
         settings.attach(self.automatic_backup_interval, 1, 0, 1, 1)
-        settings.attach(Gtk.Label(label="minutes", xalign=0), 2, 0, 1, 1)
-        settings.attach(Gtk.Label(label="Keep for", xalign=0), 3, 0, 1, 1)
+        settings.attach(Gtk.Label(label="minutes,", xalign=0), 2, 0, 1, 1)
+        settings.attach(Gtk.Label(label="keep for", xalign=0), 3, 0, 1, 1)
         settings.attach(self.automatic_backup_retention, 4, 0, 1, 1)
         settings.attach(Gtk.Label(label="days", xalign=0), 5, 0, 1, 1)
         settings.set_sensitive(self.automatic_backup_switch.get_active())
@@ -370,13 +377,13 @@ class Window(Gtk.ApplicationWindow):
         self.automatic_backup_summary.add_css_class("backup-summary")
         self.automatic_backup_summary.set_hexpand(True)
         self.automatic_backup_summary.set_wrap(True)
-        open_folder = Gtk.Button()
-        open_folder.set_tooltip_text("Open backup folder")
-        open_content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        open_content.append(Gtk.Image.new_from_icon_name("folder-open-symbolic"))
-        open_content.append(Gtk.Label(label="Open folder"))
-        open_folder.set_child(open_content)
-        open_folder.connect("clicked", self.open_backup_folder)
+        open_folder = Gtk.LinkButton.new_with_label(
+            config.BACKUP_DIR.as_uri(),
+            "Open backup folder",
+        )
+        open_folder.add_css_class("backup-folder-link")
+        open_folder.set_valign(Gtk.Align.CENTER)
+        open_folder.connect("activate-link", self.open_backup_folder)
         footer.append(self.automatic_backup_summary)
         footer.append(open_folder)
         section.append(footer)
@@ -405,18 +412,19 @@ class Window(Gtk.ApplicationWindow):
             automatic_backup_retention_days=retention,
         )
 
-    def open_backup_folder(self, *_args) -> None:
+    def open_backup_folder(self, *_args) -> bool:
         logger.info("Open backup folder button pressed")
         config.ensure_backup_directory()
         try:
             Gio.AppInfo.launch_default_for_uri(config.BACKUP_DIR.as_uri(), None)
         except GLib.Error as exc:
             self.show_background_error(str(exc))
+        return True
 
     def refresh_backup_summary(self) -> None:
         current = backups.summary()
         latest = current.latest.strftime("%Y-%m-%d %H:%M") if current.latest else "Never"
-        text = f"Scheduled: {current.count} | Last: {latest}"
+        text = f"Saved backups: {current.count} | Last: {latest}"
         css_classes = ["backup-summary"]
         if self.automatic_backup_running:
             text += " | Creating backup..."
@@ -535,11 +543,13 @@ class Window(Gtk.ApplicationWindow):
         return False
 
     def close_application(self, *_):
-        logger.info("Main window closed; quitting application")
         application = self.get_application()
-        if application:
-            application.quit()
-        return False
+        if application and hasattr(application, "hide_window"):
+            return application.hide_window(self)
+
+        logger.warning("Tray integration is unavailable; minimizing the launcher")
+        self.minimize()
+        return True
 
     def refresh(self):
         observed = docker.health()
@@ -768,8 +778,9 @@ class Window(Gtk.ApplicationWindow):
         .section-label { font-weight: 700; margin-top: 4px; }
         .info-grid { margin-top: 5px; margin-bottom: 2px; }
         .info-label { font-size: 12px; font-weight: 700; color: #6b6b6b; }
-        .backup-summary { font-size: 12px; color: #6b6b6b; }
+        .backup-summary { font-size: 14px; color: #6b6b6b; }
         .backup-error { color: #b3261e; }
+        .backup-folder-link { min-height: 0; padding: 0; font-size: 14px; color: #6b6b6b; }
         button { min-height: 38px; }
         """)
         Gtk.StyleContext.add_provider_for_display(self.get_display(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
@@ -778,12 +789,117 @@ class Window(Gtk.ApplicationWindow):
 class App(Gtk.Application):
     def __init__(self):
         super().__init__(application_id="io.kalliopen.Launcher", flags=Gio.ApplicationFlags.FLAGS_NONE)
-        self.window = None
+        self.window: Window | None = None
+        self.tray_process: subprocess.Popen | None = None
+        self.tray_check_source: int | None = None
+        self._held = False
+        self._quitting = False
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        self.hold()
+        self._held = True
+        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self.restore_window)
+        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, self.quit_from_tray)
 
     def do_activate(self):
         if self.window is None:
             self.window = Window(self)
+        self.start_tray()
         self.window.present()
+
+    def start_tray(self) -> bool:
+        if self.tray_process and self.tray_process.poll() is None:
+            return True
+
+        if self.tray_check_source is not None:
+            GLib.source_remove(self.tray_check_source)
+            self.tray_check_source = None
+
+        try:
+            self.tray_process = subprocess.Popen(
+                [sys.executable, "-m", "app.tray", str(os.getpid())],
+                start_new_session=True,
+            )
+        except OSError:
+            logger.exception("Could not start the system tray helper")
+            self.tray_process = None
+            return False
+
+        logger.info("System tray helper started with PID %s", self.tray_process.pid)
+        self.tray_check_source = GLib.timeout_add_seconds(1, self.check_tray_process)
+        return True
+
+    def check_tray_process(self) -> bool:
+        process = self.tray_process
+        if process and process.poll() is None:
+            return True
+
+        self.tray_process = None
+        self.tray_check_source = None
+        if not self._quitting:
+            exit_code = process.returncode if process else "unknown"
+            logger.warning("System tray helper exited with status %s", exit_code)
+            if self.window and not self.window.get_visible():
+                logger.info("Restoring the launcher because the tray helper is unavailable")
+                self.window.present()
+        return False
+
+    def hide_window(self, window: Gtk.Window) -> bool:
+        if not self.start_tray():
+            logger.warning("System tray is unavailable; minimizing the launcher")
+            window.minimize()
+            return True
+
+        logger.info("Main window closed; hiding it in the system tray")
+        window.hide()
+        return True
+
+    def restore_window(self) -> bool:
+        logger.info("Restoring the launcher from the system tray")
+        if self.window:
+            self.window.present()
+        return True
+
+    def quit_from_tray(self) -> bool:
+        logger.info("Quit selected from the system tray")
+        self.quit_launcher()
+        return False
+
+    def quit_launcher(self):
+        if self._quitting:
+            return
+        self._quitting = True
+        self.stop_tray()
+        if self._held:
+            self.release()
+            self._held = False
+        self.quit()
+
+    def stop_tray(self):
+        if self.tray_check_source is not None:
+            GLib.source_remove(self.tray_check_source)
+            self.tray_check_source = None
+
+        process = self.tray_process
+        self.tray_process = None
+        if not process or process.poll() is not None:
+            return
+
+        process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1)
+
+    def do_shutdown(self):
+        self._quitting = True
+        self.stop_tray()
+        if self._held:
+            self.release()
+            self._held = False
+        Gtk.Application.do_shutdown(self)
 
 
 def main():
