@@ -3,13 +3,14 @@ from __future__ import annotations
 import threading
 import webbrowser
 import logging
+from datetime import datetime
 from pathlib import Path
 
 import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, GLib, Gio
 
-from . import config, docker
+from . import backups, config, docker
 from .migration_workflow import MigrationSession, source_versions
 from .migrator.postgres import PostgresConfig
 
@@ -254,6 +255,10 @@ class Window(Gtk.ApplicationWindow):
         self.has_been_healthy = bool(self.state.get("ever_healthy", False))
         self.transition: str | None = None
         self.autostart_pending = True
+        self.background_action_count = 0
+        self.automatic_backup_running = False
+        self.automatic_backup_error: str | None = None
+        self.last_automatic_backup_attempt: datetime | None = None
         self.initialize_service_state()
         self._install_css()
         self.status_dot = Gtk.Label(label="●")
@@ -301,6 +306,7 @@ class Window(Gtk.ApplicationWindow):
         update.connect("clicked", self.update_kalliopen)
         update.set_sensitive(False)
         self.update_button = update
+        self.update_available = False
         service_actions.attach(update, 1, 0, 1, 1)
         service_actions.set_column_homogeneous(True)
         self.body.append(service_actions)
@@ -313,7 +319,10 @@ class Window(Gtk.ApplicationWindow):
         database_tools.attach(import_button, 1, 0, 1, 1)
         database_tools.attach(migrate, 0, 1, 1, 1)
         database_tools.attach(delete_button, 1, 1, 1, 1)
+        self.database_buttons = (export, import_button, migrate, delete_button)
         self.body.append(database_tools)
+        self.body.append(Gtk.Separator())
+        self.body.append(self.build_automatic_backup_section())
         self.setup = Gtk.Button(label="Run setup")
         self.setup.connect("clicked", self.run_setup)
         self.update_docker_controls()
@@ -321,8 +330,147 @@ class Window(Gtk.ApplicationWindow):
         self.set_child(self.body)
         self.refresh()
         self.refresh_versions()
+        self.refresh_backup_summary()
         GLib.timeout_add_seconds(5, self.refresh)
         GLib.timeout_add_seconds(2, self.autostart_managed_service)
+        GLib.timeout_add_seconds(15, self.check_automatic_backup)
+
+    def build_automatic_backup_section(self) -> Gtk.Widget:
+        section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        title = Gtk.Label(label="Automatic backups", xalign=0, css_classes=["section-label"])
+        title.set_hexpand(True)
+        self.automatic_backup_switch = Gtk.Switch()
+        self.automatic_backup_switch.set_active(bool(self.state["automatic_backups_enabled"]))
+        self.automatic_backup_switch.set_valign(Gtk.Align.CENTER)
+        header.append(title)
+        header.append(self.automatic_backup_switch)
+        section.append(header)
+
+        settings = Gtk.Grid(column_spacing=8, row_spacing=8)
+        self.automatic_backup_interval = Gtk.SpinButton.new_with_range(1, 10080, 1)
+        self.automatic_backup_interval.set_value(self.state["automatic_backup_interval_minutes"])
+        self.automatic_backup_interval.set_width_chars(5)
+        self.automatic_backup_retention = Gtk.SpinButton.new_with_range(1, 3650, 1)
+        self.automatic_backup_retention.set_value(self.state["automatic_backup_retention_days"])
+        self.automatic_backup_retention.set_width_chars(5)
+        settings.attach(Gtk.Label(label="Every", xalign=0), 0, 0, 1, 1)
+        settings.attach(self.automatic_backup_interval, 1, 0, 1, 1)
+        settings.attach(Gtk.Label(label="minutes", xalign=0), 2, 0, 1, 1)
+        settings.attach(Gtk.Label(label="Keep for", xalign=0), 3, 0, 1, 1)
+        settings.attach(self.automatic_backup_retention, 4, 0, 1, 1)
+        settings.attach(Gtk.Label(label="days", xalign=0), 5, 0, 1, 1)
+        settings.set_sensitive(self.automatic_backup_switch.get_active())
+        self.automatic_backup_settings = settings
+        section.append(settings)
+
+        footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.automatic_backup_summary = Gtk.Label(xalign=0)
+        self.automatic_backup_summary.add_css_class("backup-summary")
+        self.automatic_backup_summary.set_hexpand(True)
+        self.automatic_backup_summary.set_wrap(True)
+        open_folder = Gtk.Button()
+        open_folder.set_tooltip_text("Open backup folder")
+        open_content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        open_content.append(Gtk.Image.new_from_icon_name("folder-open-symbolic"))
+        open_content.append(Gtk.Label(label="Open folder"))
+        open_folder.set_child(open_content)
+        open_folder.connect("clicked", self.open_backup_folder)
+        footer.append(self.automatic_backup_summary)
+        footer.append(open_folder)
+        section.append(footer)
+
+        self.automatic_backup_switch.connect("notify::active", self.automatic_backup_toggled)
+        self.automatic_backup_interval.connect("value-changed", self.automatic_backup_values_changed)
+        self.automatic_backup_retention.connect("value-changed", self.automatic_backup_values_changed)
+        return section
+
+    def automatic_backup_toggled(self, switch, _parameter) -> None:
+        enabled = switch.get_active()
+        logger.info("Automatic backups %s", "enabled" if enabled else "disabled")
+        self.automatic_backup_settings.set_sensitive(enabled)
+        self.automatic_backup_error = None
+        if enabled:
+            self.last_automatic_backup_attempt = None
+        self.set_service_state(automatic_backups_enabled=enabled)
+        self.refresh_backup_summary()
+
+    def automatic_backup_values_changed(self, *_args) -> None:
+        interval = self.automatic_backup_interval.get_value_as_int()
+        retention = self.automatic_backup_retention.get_value_as_int()
+        logger.info("Automatic backup settings changed: interval=%s minutes retention=%s days", interval, retention)
+        self.set_service_state(
+            automatic_backup_interval_minutes=interval,
+            automatic_backup_retention_days=retention,
+        )
+
+    def open_backup_folder(self, *_args) -> None:
+        logger.info("Open backup folder button pressed")
+        config.ensure_backup_directory()
+        try:
+            Gio.AppInfo.launch_default_for_uri(config.BACKUP_DIR.as_uri(), None)
+        except GLib.Error as exc:
+            self.show_background_error(str(exc))
+
+    def refresh_backup_summary(self) -> None:
+        current = backups.summary()
+        latest = current.latest.strftime("%Y-%m-%d %H:%M") if current.latest else "Never"
+        text = f"Scheduled: {current.count} | Last: {latest}"
+        css_classes = ["backup-summary"]
+        if self.automatic_backup_running:
+            text += " | Creating backup..."
+        elif self.automatic_backup_error:
+            text += " | Last attempt failed"
+            css_classes.append("backup-error")
+            self.automatic_backup_summary.set_tooltip_text(self.automatic_backup_error)
+        else:
+            self.automatic_backup_summary.set_tooltip_text(None)
+        self.automatic_backup_summary.set_text(text)
+        self.automatic_backup_summary.set_css_classes(css_classes)
+        for button in self.database_buttons:
+            button.set_sensitive(not self.automatic_backup_running)
+        self.update_button.set_sensitive(self.update_available and not self.automatic_backup_running)
+        self.setup.set_sensitive(not self.automatic_backup_running)
+
+    def check_automatic_backup(self) -> bool:
+        self.refresh_backup_summary()
+        if not self.state.get("automatic_backups_enabled", False):
+            return True
+        if self.automatic_backup_running or self.background_action_count or self.transition:
+            return True
+        if not self.state.get("setup_complete", False) or not docker.available():
+            return True
+
+        interval = int(self.state["automatic_backup_interval_minutes"])
+        if not backups.due(interval, self.last_automatic_backup_attempt):
+            return True
+
+        retention = int(self.state["automatic_backup_retention_days"])
+        self.last_automatic_backup_attempt = datetime.now().astimezone()
+        self.automatic_backup_running = True
+        self.automatic_backup_error = None
+        self.refresh_backup_summary()
+        logger.info("Starting scheduled database backup")
+
+        def worker():
+            try:
+                destination = backups.create(retention)
+            except Exception as exc:
+                logger.exception("Scheduled database backup failed")
+                GLib.idle_add(self.finish_automatic_backup, None, str(exc))
+            else:
+                logger.info("Scheduled database backup saved to %s", destination)
+                GLib.idle_add(self.finish_automatic_backup, destination, None)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def finish_automatic_backup(self, _destination, error) -> bool:
+        self.automatic_backup_running = False
+        self.automatic_backup_error = error
+        self.refresh_backup_summary()
+        return False
 
     @staticmethod
     def address_text() -> str:
@@ -418,7 +566,9 @@ class Window(Gtk.ApplicationWindow):
         self.status.set_text({"running": "Running", "starting": "Starting", "stopped": "Stopped", "unhealthy": "Unhealthy"}.get(state, state.title()))
         self.status_dot.set_css_classes(["status-dot", f"status-{state}"])
         self.action.set_label("Stop" if state in {"running", "starting", "stopping"} else "Start")
-        self.action.set_sensitive(docker.available() and state != "stopping")
+        self.action.set_sensitive(
+            docker.available() and state != "stopping" and not self.automatic_backup_running
+        )
         self.open_button.set_sensitive(state == "running")
         self.address.set_text(self.address_text())
         self.update_docker_controls()
@@ -435,7 +585,8 @@ class Window(Gtk.ApplicationWindow):
     def _set_versions(self, current, latest, current_digest, latest_digest):
         self.current_version.set_text(self._version_text(current, "Not installed"))
         self.latest_version.set_text(self._version_text(latest, "Unavailable"))
-        self.update_button.set_sensitive(bool(current_digest and latest_digest and current_digest != latest_digest))
+        self.update_available = bool(current_digest and latest_digest and current_digest != latest_digest)
+        self.update_button.set_sensitive(self.update_available and not self.automatic_backup_running)
 
     @staticmethod
     def _version_text(value, fallback):
@@ -443,6 +594,7 @@ class Window(Gtk.ApplicationWindow):
 
     def run_async(self, fn, success="Done", on_success=None, on_failure=None):
         logger.info("Starting background action: %s", success)
+        self.background_action_count += 1
         def worker():
             try:
                 fn()
@@ -458,6 +610,7 @@ class Window(Gtk.ApplicationWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def finish_background_notice(self, message, callback):
+        self.background_action_count = max(0, self.background_action_count - 1)
         if callback:
             callback()
         dialog = Gtk.AlertDialog(
@@ -470,6 +623,7 @@ class Window(Gtk.ApplicationWindow):
         return False
 
     def finish_background_action(self, succeeded, message, callback):
+        self.background_action_count = max(0, self.background_action_count - 1)
         if callback:
             callback()
         if not succeeded:
@@ -614,6 +768,8 @@ class Window(Gtk.ApplicationWindow):
         .section-label { font-weight: 700; margin-top: 4px; }
         .info-grid { margin-top: 5px; margin-bottom: 2px; }
         .info-label { font-size: 12px; font-weight: 700; color: #6b6b6b; }
+        .backup-summary { font-size: 12px; color: #6b6b6b; }
+        .backup-error { color: #b3261e; }
         button { min-height: 38px; }
         """)
         Gtk.StyleContext.add_provider_for_display(self.get_display(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)

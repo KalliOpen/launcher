@@ -11,7 +11,14 @@ BACKUP_DIR = APP_DIR / "backups"
 STATE_FILE = APP_DIR / "state.json"
 APP_IMAGE = "ghcr.io/kalliopen/kalliopen:latest"
 MIGRATOR_IMAGE = "ghcr.io/kalliopen/kalliopen-migrator:latest"
+APP_PORT = 80
 COMPOSE_FILE = APP_DIR / "compose.yml"
+
+AUTOMATIC_BACKUP_DEFAULTS = {
+    "automatic_backups_enabled": False,
+    "automatic_backup_interval_minutes": 60,
+    "automatic_backup_retention_days": 30,
+}
 
 
 def load() -> dict:
@@ -47,8 +54,15 @@ def save(state: dict) -> None:
 
 def ensure_state() -> dict:
     state = load()
+    changed = False
     if "postgres_password" not in state:
         state["postgres_password"] = secrets.token_urlsafe(24)
+        changed = True
+    for key, value in AUTOMATIC_BACKUP_DEFAULTS.items():
+        if key not in state:
+            state[key] = value
+            changed = True
+    if changed:
         save(state)
     else:
         _ensure_private_directory(APP_DIR)
