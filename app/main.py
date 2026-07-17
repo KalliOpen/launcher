@@ -446,6 +446,9 @@ class Window(Gtk.ApplicationWindow):
         def worker():
             try:
                 fn()
+            except docker.DockerReloginRequired as exc:
+                logger.info("Docker configuration requires a new login session")
+                GLib.idle_add(self.finish_background_notice, str(exc), on_failure)
             except Exception as exc:
                 logger.exception("Background action failed")
                 GLib.idle_add(self.finish_background_action, False, str(exc), on_failure)
@@ -453,6 +456,18 @@ class Window(Gtk.ApplicationWindow):
                 logger.info("Background action completed: %s", success)
                 GLib.idle_add(self.finish_background_action, True, success, on_success)
         threading.Thread(target=worker, daemon=True).start()
+
+    def finish_background_notice(self, message, callback):
+        if callback:
+            callback()
+        dialog = Gtk.AlertDialog(
+            message="Docker access configured",
+            detail=message,
+            buttons=["Close"],
+        )
+        dialog.show(self)
+        self.refresh()
+        return False
 
     def finish_background_action(self, succeeded, message, callback):
         if callback:
@@ -553,7 +568,7 @@ class Window(Gtk.ApplicationWindow):
 
     def delete_db(self, *_):
         logger.info("Delete database button pressed")
-        self.confirm("Delete all KalliOpen database data? This cannot be undone.",
+        self.confirm("Delete all KalliOpen database data? A recovery backup will be created automatically.",
                      self.run_database_delete)
 
     def run_database_delete(self):

@@ -18,6 +18,10 @@ from . import config
 logger = logging.getLogger(__name__)
 
 
+class DockerReloginRequired(RuntimeError):
+    """Docker access was configured, but the login session must be refreshed."""
+
+
 def available() -> bool:
     return shutil.which("docker") is not None and subprocess.run(
         ["docker", "info"], capture_output=True
@@ -41,8 +45,8 @@ def configure() -> None:
         username = pwd.getpwuid(os.getuid()).pw_name
         logger.info("Adding user %s to the Docker group", username)
         subprocess.run(["pkexec", "usermod", "-aG", "docker", username], check=True)
-        raise RuntimeError(
-            "Docker access has been configured. Log out of Linux Mint and log back in, then reopen KalliOpen Launcher."
+        raise DockerReloginRequired(
+            "Log out and log back in. Then reopen KalliOpen Launcher and press Start."
         )
     raise RuntimeError(detail or "Docker is installed but unavailable.")
 
@@ -96,7 +100,7 @@ def application_url() -> str:
     host = local_ip()
     if host == "unavailable" or host.startswith("127."):
         host = "localhost"
-    return f"http://{host}:{config.APP_PORT}"
+    return f"http://{host}"
 
 
 def managed_install_exists() -> bool:
@@ -178,22 +182,67 @@ def import_database(source: Path) -> None:
 
 def delete_database() -> None:
     logger.info("Deleting KalliOpen database schema")
+    backup = automatic_backup_path("pre-delete")
+    export_database(backup)
+    logger.info("Pre-delete database backup saved to %s", backup)
     stop_app()
-    ensure_database_running()
-    reset_database_schema()
-    migrate()
-    start_app()
+    try:
+        reset_database_schema()
+        migrate()
+        start_app()
+    except Exception as exc:
+        raise RuntimeError(
+            f"{exc}\n\nThe previous database backup is saved at:\n{backup}\n\nKalliOpen remains stopped."
+        ) from exc
 
 
 def reset_database_schema() -> None:
     logger.info("Resetting KalliOpen database schema")
     compose("exec", "-T", "db", "psql", "-U", "kalliopen", "-d", "kalliopen", "-v",
-            "ON_ERROR_STOP=1", "-c", "DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+            "ON_ERROR_STOP=1", "-c",
+            "DROP SCHEMA IF EXISTS public CASCADE; "
+            "DROP SCHEMA IF EXISTS drizzle CASCADE; "
+            "CREATE SCHEMA public;")
+
+
+def _public_table_count() -> int:
+    result = compose(
+        "exec", "-T", "db", "psql", "-U", "kalliopen", "-d", "kalliopen",
+        "--no-psqlrc", "--tuples-only", "--no-align", "-c",
+        "SELECT COUNT(*) FROM information_schema.tables "
+        "WHERE table_schema = 'public' AND table_type = 'BASE TABLE';",
+        log=False,
+    )
+    try:
+        return int(result.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError("Could not verify the migrated database schema.") from exc
+
+
+def _run_migrator() -> None:
+    result = compose("run", "--rm", "migrator")
+    output = (result.stdout or result.stderr or "").strip()
+    if output:
+        logger.info("Migrator output:\n%s", output)
 
 
 def migrate() -> None:
     logger.info("Running KalliOpen migrator container")
-    compose("run", "--rm", "migrator")
+    _run_migrator()
+    if _public_table_count() > 0:
+        return
+
+    logger.warning("No application tables exist; clearing stale Drizzle migration metadata")
+    compose(
+        "exec", "-T", "db", "psql", "-U", "kalliopen", "-d", "kalliopen",
+        "-v", "ON_ERROR_STOP=1", "-c", "DROP SCHEMA IF EXISTS drizzle CASCADE;",
+    )
+    _run_migrator()
+    if _public_table_count() == 0:
+        raise RuntimeError(
+            "The migrator exited successfully but did not create any application tables. "
+            "KalliOpen was not started."
+        )
 
 
 def stop_app() -> None:

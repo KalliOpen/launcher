@@ -11,7 +11,6 @@ BACKUP_DIR = APP_DIR / "backups"
 STATE_FILE = APP_DIR / "state.json"
 APP_IMAGE = "ghcr.io/kalliopen/kalliopen:latest"
 MIGRATOR_IMAGE = "ghcr.io/kalliopen/kalliopen-migrator:latest"
-APP_PORT = 3000
 COMPOSE_FILE = APP_DIR / "compose.yml"
 
 
@@ -94,7 +93,7 @@ services:
         condition: service_completed_successfully
     environment: *app-environment
     ports:
-      - "{APP_PORT}:{APP_PORT}"
+      - "80:3000"
   migrator:
     image: {MIGRATOR_IMAGE}
     depends_on:
