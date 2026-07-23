@@ -108,6 +108,8 @@ services:
     environment: *app-environment
     ports:
       - "80:3000"
+    volumes:
+      - appdata:/app/data
   migrator:
     image: {MIGRATOR_IMAGE}
     depends_on:
@@ -118,6 +120,7 @@ services:
     restart: "no"
 volumes:
   pgdata:
+  appdata:
 '''
 
 

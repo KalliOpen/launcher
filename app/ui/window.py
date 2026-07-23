@@ -50,7 +50,6 @@ class Window(Gtk.ApplicationWindow):
         import_button = Gtk.Button(label="Import database")
         import_button.connect("clicked", self.import_db)
         delete_button = Gtk.Button(label="Delete database")
-        delete_button.add_css_class("action-stop")
         delete_button.connect("clicked", self.delete_db)
         self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         self.body.set_margin_top(28); self.body.set_margin_bottom(28)
